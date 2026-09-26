@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: flowguard
+    runtime: docker
+    plan: free
+    region: singapore
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: FLOWGUARD_PUBLIC_URL
+        sync: false
