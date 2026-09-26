@@ -48,7 +48,7 @@ import hashlib
 import json
 import logging
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -61,6 +61,12 @@ from contextlib import asynccontextmanager
 # Project root for serving static files
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Indian Standard Time (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_today() -> date:
+    return datetime.now(IST).date()
+
 from .models import (
     ActionTag,
     CashPosition,
@@ -71,9 +77,11 @@ from .models import (
     Obligation,
     ObligationCategory,
     ScoreRequest,
+    SourceType,
     UserProfile,
 )
 from .scorer import run_engine
+from .regulatory import format_regulatory_context
 from .parser import (
     ST_AVAILABLE,
     SPACY_AVAILABLE,
@@ -109,8 +117,11 @@ from .database import (
     get_transactions,
     get_tx_summary,
     delete_transaction,
+    record_cash_snapshot,
+    get_latest_cash_snapshot,
     TxMedium,
     TX_PREFIX,
+    compute_obligation_id,
 )
 from .file_ingest import (
     import_csv,
@@ -123,6 +134,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 ENGINE_VERSION = "2.0.0"
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # ─────────────────────────────────────────────
 # Audit Store (abstracted for PostgreSQL migration)
@@ -229,6 +241,7 @@ class HealthResponse(BaseModel):
     spacy_available: bool
     sentence_transformers_available: bool
     timestamp: datetime
+    groq: dict = Field(default_factory=dict)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -279,22 +292,42 @@ def _store_audit(result: EngineResult) -> None:
     })
 
 
+_FILTER_KEYWORDS = ("show me", "show all", "list all", "list ", "filter ", "find ",
+                    "search ", "payments to", "payments for", "transactions")
+
+
+def _regex_guess_intent(raw_text: str, ref: date) -> str:
+    """Best-effort INGEST/FILTER/STATUS guess when Groq is unavailable or failed.
+    No LLM classification available, so this is a coarse heuristic, not a replacement.
+    """
+    text_lower = raw_text.lower()
+    if any(kw in text_lower for kw in _FILTER_KEYWORDS):
+        return "FILTER"
+    obligation_dicts, cash_inr = parse_text_to_obligations(raw_text, ref)
+    if obligation_dicts or cash_inr > 0:
+        return "INGEST"
+    return "STATUS"
+
+
 def _try_groq_parse(raw_text: str, ref: date) -> tuple[Optional[ScoreRequest], dict]:
     """Attempt to parse input via Groq LLM (Layer 2).
     Returns (ScoreRequest | None, metadata_dict).
     metadata_dict always has: intent, bot_reply, filter_query
     """
-    meta = {"intent": "STATUS", "bot_reply": "", "filter_query": {}}
+    meta = {"intent": "STATUS", "bot_reply": "", "filter_query": {}, "cash_balance_inr": 0.0}
     if not is_groq_available():
+        meta["intent"] = _regex_guess_intent(raw_text, ref)
         return None, meta
 
     groq_result = groq_parse_input(raw_text, reference_date=ref)
     if groq_result is None:
+        meta["intent"] = _regex_guess_intent(raw_text, ref)
         return None, meta
 
-    meta["intent"]       = groq_result.get("intent", "STATUS")
-    meta["bot_reply"]    = groq_result.get("bot_reply", "")
-    meta["filter_query"] = groq_result.get("filter_query", {})
+    meta["intent"]           = groq_result.get("intent", "STATUS")
+    meta["bot_reply"]        = groq_result.get("bot_reply", "")
+    meta["filter_query"]     = groq_result.get("filter_query", {})
+    meta["cash_balance_inr"] = float(groq_result.get("cash_balance_inr") or 0)
 
     logger.info("Groq intent=%s, %d obligations",
                 meta["intent"], len(groq_result.get("obligations", [])))
@@ -307,30 +340,54 @@ def _try_groq_parse(raw_text: str, ref: date) -> tuple[Optional[ScoreRequest], d
     obligations: list[Obligation] = []
     for ob_raw in obligations_raw:
         try:
-            cat_str  = ob_raw.get("category", "OTHER").upper()
-            flex_str = ob_raw.get("flexibility", "NEGOTIABLE").upper()
-            due      = ob_raw.get("due_date", (ref + timedelta(days=7)).isoformat())
-            desc     = ob_raw.get("description", ob_raw.get("counterparty_name", "Unknown"))
+            amt_raw = ob_raw.get("amount_inr")
+            if amt_raw is None:
+                logger.info("Skipping obligation with missing amount (anti-hallucination): %s", ob_raw)
+                continue
+            amt = float(amt_raw)
+            if amt <= 0:
+                logger.info("Skipping obligation with non-positive amount: %s", ob_raw)
+                continue
 
-            category   = cat_str if cat_str in [e.value for e in ObligationCategory] else infer_category(desc)
+            due_raw = ob_raw.get("due_date")
+            if not due_raw:
+                logger.info("Skipping obligation with missing due date (anti-hallucination): %s", ob_raw)
+                continue
+
+            try:
+                due_date_val = date.fromisoformat(str(due_raw).strip())
+            except ValueError:
+                logger.info("Skipping obligation with invalid due date: %s", due_raw)
+                continue
+
+            cat_str  = str(ob_raw.get("category") or "OTHER").upper()
+            flex_str = str(ob_raw.get("flexibility") or "NEGOTIABLE").upper()
+            desc     = str(ob_raw.get("description") or ob_raw.get("counterparty_name") or "Unknown").strip()
+            cparty   = str(ob_raw.get("counterparty_name") or "Unknown").strip()
+
+            category    = cat_str if cat_str in [e.value for e in ObligationCategory] else infer_category(desc)
             flexibility = flex_str if flex_str in ("FIXED", "NEGOTIABLE", "DEFERRABLE") else infer_flexibility(desc, category)
             penalty_rate = infer_penalty_rate(category)
 
+            oid = compute_obligation_id(cparty, amt, due_date_val)
+
             ob = Obligation(
-                obligation_id=hashlib.sha256(
-                    f"{ob_raw.get('counterparty_name', 'Unknown')}|{ob_raw.get('amount_inr', 0)}|{due}".encode()
-                ).hexdigest()[:16],
-                counterparty_name=ob_raw.get("counterparty_name", "Unknown"),
+                obligation_id=oid,
+                counterparty_name=cparty,
                 description=desc[:120],
-                amount_inr=float(ob_raw.get("amount_inr", 0)),
+                amount_inr=amt,
                 penalty_rate_annual_pct=penalty_rate,
-                due_date=date.fromisoformat(due),
-                max_deferral_days=7,
+                due_date=due_date_val,
+                max_deferral_days=7 if flexibility != "FIXED" else 0,
                 category=category,
                 flexibility=flexibility,
                 relationship_score=50.0,
                 is_recurring=category in ("SALARY", "RENT", "UTILITY", "SECURED_LOAN"),
                 source_hash=hashlib.sha256(raw_text.encode()).hexdigest()[:16],
+                source_type=SourceType.CHAT,
+                amount_source="user_input",
+                due_date_source="user_input",
+                category_source="llm_classification",
                 parse_confidence=0.85,
             )
             obligations.append(ob)
@@ -356,7 +413,7 @@ def _parse_raw_to_score_request(req: NLPParseRequest) -> tuple[ScoreRequest, dic
     Pipeline: Groq (llama3-8b) → Pydantic validate → fallback to regex parser.
     groq_meta always contains: intent, bot_reply, filter_query.
     """
-    ref = date.today()
+    ref = get_ist_today()
     meta = {"intent": "STATUS", "bot_reply": "", "filter_query": {}}
 
     # Layer 2: Try Groq parsing first
@@ -455,11 +512,9 @@ async def health():
         spacy_available=SPACY_AVAILABLE,
         sentence_transformers_available=ST_AVAILABLE,
         timestamp=datetime.utcnow(),
+        groq=get_groq_status(),
     )
-    # Attach Groq status as extra info (won't break HealthResponse schema)
-    resp_dict = resp.model_dump()
-    resp_dict["groq"] = get_groq_status()
-    return resp_dict
+    return resp
 
 
 @app.post(
@@ -508,6 +563,16 @@ async def score(req: ScoreRequest) -> EngineResult:
         result.summary_narrative  = narrate_result(result, channel="web")
         result.whatsapp_summary   = narrate_whatsapp_preview(result)
         _store_audit(result)
+        
+        # Persist engine run to SQLite
+        db = SessionLocal()
+        try:
+            store_engine_run(db, result.run_id, result.model_dump(), source_type="API")
+        except Exception as e:
+            logger.warning("Failed to store engine run to DB: %s", e)
+        finally:
+            db.close()
+
         return result
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -560,7 +625,7 @@ async def pipeline(req: NLPParseRequest):
       STATUS  → run the full scoring engine, return decisions + narrative.
       FILTER  → query transactions/obligations DB, return matching records as JSON.
     """
-    ref = date.today()
+    ref = get_ist_today()
 
     # ── Run Groq to classify intent and extract data ──
     groq_req, meta = _try_groq_parse(req.raw_text, ref)
@@ -571,9 +636,11 @@ async def pipeline(req: NLPParseRequest):
     # ── INGEST: just store and return quick affirmation ──────────────────
     if intent == "INGEST":
         stored_obs = []
-        if groq_req and groq_req.obligations:
-            db = SessionLocal()
-            try:
+        cash_recorded = None
+        cash_amt = meta.get("cash_balance_inr", 0.0)
+        db = SessionLocal()
+        try:
+            if groq_req and groq_req.obligations:
                 for ob in groq_req.obligations:
                     ob_dict = {
                         "counterparty_name": ob.counterparty_name,
@@ -592,13 +659,34 @@ async def pipeline(req: NLPParseRequest):
                         "amount": ob.amount_inr,
                         "new": is_new,
                     })
-            finally:
-                db.close()
+            else:
+                # Groq unavailable/failed — fall back to the regex parser so
+                # INGEST still records data instead of silently doing nothing.
+                obligation_dicts, cash_inr = parse_text_to_obligations(req.raw_text, ref)
+                for ob_dict in obligation_dicts:
+                    row, is_new = upsert_obligation(db, ob_dict, "CHAT", None)
+                    stored_obs.append({
+                        "ref": ob_dict["obligation_id"],
+                        "counterparty": ob_dict["counterparty_name"],
+                        "amount": ob_dict["amount_inr"],
+                        "new": is_new,
+                    })
+                if cash_inr > 0:
+                    cash_amt = cash_inr
+
+            # Cash balance can be reported standalone (no obligations in the
+            # same message) — persist it so a later STATUS query can find it.
+            if cash_amt and cash_amt > 0:
+                snap = record_cash_snapshot(db, cash_amt, ref, source_type="CHAT", is_verified=False)
+                cash_recorded = snap.available_cash_inr
+        finally:
+            db.close()
 
         return {
             "intent":    "INGEST",
             "bot_reply": bot_reply or f"✅ Recorded {len(stored_obs)} obligation(s).",
             "stored":    stored_obs,
+            "cash_recorded_inr": cash_recorded,
         }
 
     # ── FILTER: build DB query and return results ────────────────────────
@@ -660,12 +748,64 @@ async def pipeline(req: NLPParseRequest):
         try:
             score_req, _ = _parse_raw_to_score_request(req)
         except HTTPException:
-            # No obligations extractable at all — return the bot_reply alone
-            return {
-                "intent":    "STATUS",
-                "bot_reply": bot_reply or "Sure! Analysing your current cash flow…",
-                "note":      "No obligations found in current session. Please ingest some data first.",
+            # Nothing extractable from THIS message — fall back to obligations
+            # already ingested and stored in the DB (e.g. from a prior INGEST turn).
+            db = SessionLocal()
+            try:
+                rows = get_all_obligations(db, active_only=True)
+                snapshot = get_latest_cash_snapshot(db)
+            finally:
+                db.close()
+
+            if not rows:
+                return {
+                    "intent":    "STATUS",
+                    "bot_reply": bot_reply or "Sure! Analysing your current cash flow…",
+                    "note":      "No obligations found. Please ingest some data first.",
+                }
+
+            db_obligations: list[Obligation] = []
+            for row in rows:
+                try:
+                    db_obligations.append(Obligation(**row.to_dict()))
+                except Exception as e:
+                    logger.warning("Skipping malformed DB obligation %s: %s", row.obligation_id, e)
+
+            if not db_obligations:
+                return {
+                    "intent":    "STATUS",
+                    "bot_reply": bot_reply or "Sure! Analysing your current cash flow…",
+                    "note":      "No obligations found. Please ingest some data first.",
+                }
+
+            cash_position = CashPosition(
+                available_cash_inr=snapshot.available_cash_inr if snapshot else 0.0,
+                as_of_date=ref,
+                cash_is_verified=snapshot.is_verified if snapshot else False,
+            )
+            score_req = ScoreRequest(obligations=db_obligations, cash_position=cash_position)
+
+    # Ensure every obligation the engine is about to score actually exists in
+    # the DB — store_engine_run() below writes decisions with a FOREIGN KEY
+    # to obligations.obligation_id, which fails silently otherwise (e.g. when
+    # this message's obligations were parsed fresh and never went through INGEST).
+    # upsert_obligation is idempotent, so this is a no-op for already-stored rows.
+    db = SessionLocal()
+    try:
+        for ob in score_req.obligations:
+            ob_dict = {
+                "counterparty_name": ob.counterparty_name,
+                "amount_inr":        ob.amount_inr,
+                "due_date":          ob.due_date,
+                "category":          ob.category.value,
+                "flexibility":       ob.flexibility.value,
+                "description":       ob.description,
+                "obligation_id":     ob.obligation_id,
+                "penalty_rate_annual_pct": ob.penalty_rate_annual_pct,
             }
+            upsert_obligation(db, ob_dict, "CHAT", None)
+    finally:
+        db.close()
 
     result = run_engine(
         obligations=score_req.obligations,
@@ -682,6 +822,8 @@ async def pipeline(req: NLPParseRequest):
             "score_band": decision.score_band.value,
             "action": decision.action.value,
             "penalty_per_day_inr": decision.penalty_per_day_inr,
+            "category": decision.category.value,
+            "regulatory_context": format_regulatory_context(decision.category.value),
             "cot_reason": decision.cot_reason,
             "cot_tradeoff": decision.cot_tradeoff,
             "cot_downstream": decision.cot_downstream,
@@ -699,6 +841,15 @@ async def pipeline(req: NLPParseRequest):
     result.summary_narrative = narrative
     result.whatsapp_summary  = preview
     _store_audit(result)
+
+    db = SessionLocal()
+    try:
+        store_engine_run(db, result.run_id, result.model_dump(),
+                         raw_input=req.raw_text, source_type="CHAT")
+    except Exception as e:
+        logger.warning("Failed to store engine run to DB: %s", e)
+    finally:
+        db.close()
 
     return {
         "intent":          "STATUS",
@@ -843,6 +994,8 @@ async def upload_csv(file: UploadFile = File(...)):
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
     result = import_csv(content, file.filename or "upload.csv")
     return result.to_dict()
 
@@ -857,6 +1010,8 @@ async def upload_pdf(file: UploadFile = File(...)):
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
     result = import_pdf(content, file.filename or "upload.pdf")
     return result.to_dict()
 
@@ -872,6 +1027,8 @@ async def upload_image(file: UploadFile = File(...)):
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
     result = import_image(content, file.filename or "upload.jpg")
     return result.to_dict()
 
@@ -1107,7 +1264,7 @@ async def global_error_handler(request: Request, exc: Exception):
         status_code=500,
         content={
             "error": "internal_server_error",
-            "detail": str(exc),
+            "detail": "An internal error occurred. Please try again or contact support.",
             "hint":   "Check server logs for full traceback.",
         },
     )

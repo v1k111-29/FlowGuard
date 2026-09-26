@@ -94,10 +94,6 @@ from sqlalchemy.orm import (
 
 logger = logging.getLogger(__name__)
 
-
-def compute_file_hash(content: bytes) -> str:
-    """SHA-256 of file content for import dedup."""
-    return hashlib.sha256(content).hexdigest()
 # ─────────────────────────────────────────────
 # DATABASE PATH & ENGINE
 # ─────────────────────────────────────────────
@@ -183,7 +179,8 @@ class ObligationRow(Base):
     updated_at          = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships
-    decisions           = relationship("DecisionRow", back_populates="obligation")
+    decisions           = relationship("DecisionRow", back_populates="obligation",
+                                       cascade="all, delete-orphan")
 
     def to_dict(self) -> dict:
         return {
@@ -404,12 +401,19 @@ def upsert_obligation(db: Session, data: dict, source_type: str = "CHAT",
 
     existing = db.query(ObligationRow).filter_by(obligation_id=oid).first()
     if existing:
-        # Update mutable fields
-        for key in ("description", "penalty_rate_annual", "max_deferral_days",
-                     "category", "flexibility", "relationship_score", "notes"):
-            if key in data and data[key] is not None:
-                db_key = "penalty_rate_annual" if key == "penalty_rate_annual_pct" else key
-                setattr(existing, db_key, data[key])
+        # Update mutable fields — map input dict keys to ORM column names
+        _field_map = {
+            "description":            "description",
+            "penalty_rate_annual_pct": "penalty_rate_annual",  # ← key fix
+            "max_deferral_days":      "max_deferral_days",
+            "category":               "category",
+            "flexibility":            "flexibility",
+            "relationship_score":     "relationship_score",
+            "notes":                  "notes",
+        }
+        for src_key, db_col in _field_map.items():
+            if src_key in data and data[src_key] is not None:
+                setattr(existing, db_col, data[src_key])
         existing.updated_at = datetime.utcnow()
         db.commit()
         return existing, False
@@ -502,6 +506,30 @@ def record_file_import(db: Session, file_hash: str, filename: str,
     db.add(row)
     db.commit()
     return row
+
+
+def record_cash_snapshot(db: Session, available_cash_inr: float, as_of_date: date,
+                         source_type: str = "CHAT", is_verified: bool = False) -> CashSnapshotRow:
+    """Persist a self-reported or verified cash balance snapshot."""
+    row = CashSnapshotRow(
+        available_cash_inr=available_cash_inr,
+        as_of_date=as_of_date,
+        is_verified=is_verified,
+        source_type=source_type,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def get_latest_cash_snapshot(db: Session) -> Optional[CashSnapshotRow]:
+    """Fetch the most recently recorded cash snapshot, if any."""
+    return (
+        db.query(CashSnapshotRow)
+        .order_by(CashSnapshotRow.created_at.desc())
+        .first()
+    )
 
 
 def get_all_obligations(db: Session, category: Optional[str] = None,
@@ -674,13 +702,12 @@ def update_user_profile(db: Session, data: dict) -> UserProfileRow:
 
 def get_db_status() -> dict:
     """Return DB health info."""
+    db = SessionLocal()
     try:
-        db = SessionLocal()
         obl_count = db.query(ObligationRow).count()
         run_count = db.query(EngineRunRow).count()
         file_count = db.query(FileImportRow).count()
         txn_count = db.query(TransactionRow).count()
-        db.close()
         return {
             "status": "connected",
             "path": str(_DB_PATH),
@@ -691,3 +718,6 @@ def get_db_status() -> dict:
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+    finally:
+        db.close()
+

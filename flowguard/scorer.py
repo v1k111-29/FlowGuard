@@ -687,6 +687,7 @@ def run_engine(
             counterparty_name=ob.counterparty_name,
             amount_inr=ob.amount_inr,
             due_date=ob.due_date,
+            category=ob.category,
             consequence_score=cs,
             score_band=_score_band(cs),
             sub_scores=subs,
@@ -715,7 +716,7 @@ def run_engine(
     total_penalty_exposure = sum(d.penalty_per_day_inr for d in deferred_decisions)
 
     result = EngineResult(
-        run_id=str(uuid.uuid4())[:8],
+        run_id=str(uuid.uuid4()),
         as_of_date=today,
         available_cash_inr=available,
         total_obligations_inr=round(total_owed, 2),

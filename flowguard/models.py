@@ -139,9 +139,13 @@ class Obligation(BaseModel):
                     "1.0 = structured input, <0.5 = vague/inferred."
     )
 
-    # ── metadata ──────────────────────────────
+    # ── metadata & provenance ─────────────────
     is_recurring: bool               = Field(False)
     source_hash: Optional[str]       = Field(None, description="SHA-256 for dedup.")
+    source_type: SourceType          = Field(SourceType.CHAT, description="Origin: CHAT, CSV, PDF, IMAGE, API")
+    amount_source: str               = Field("user_input", description="user_input | document | deterministic_calc")
+    due_date_source: str             = Field("user_input", description="user_input | document | statutory_rule")
+    category_source: str             = Field("deterministic_rule", description="deterministic_rule | user_input | llm_classification")
     notes: Optional[str]             = Field(None)
 
     # ── validation ────────────────────────────
@@ -150,7 +154,7 @@ class Obligation(BaseModel):
     def amount_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("amount_inr must be positive.")
-        return round(v, 2)
+        return round(float(v), 2)
 
     @field_validator("due_date")
     @classmethod
@@ -209,6 +213,7 @@ class DecisionRecord(BaseModel):
     counterparty_name: str
     amount_inr: float
     due_date: date
+    category: ObligationCategory
 
     # ── scoring ───────────────────────────────
     consequence_score: float         = Field(..., ge=0, le=100)
@@ -317,4 +322,32 @@ class UserProfile(BaseModel):
     business_description: Optional[str] = None
     gstin: Optional[str] = None
     annual_turnover: Optional[str] = None
+
+    @field_validator("gstin")
+    @classmethod
+    def validate_gstin(cls, v: Optional[str]) -> Optional[str]:
+        if not v or not v.strip():
+            return None
+        v = v.strip().upper()
+        import re
+        if not re.match(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$", v):
+            raise ValueError("Invalid GSTIN format. Expected 15-character alphanumeric (e.g., 22AAAAA0000A1Z5).")
+        return v
+
+
+class ExtractedObligation(BaseModel):
+    """
+    Stage A Extraction contract:
+    Represents raw extracted fields before business rule validation.
+    Missing values remain None (UNKNOWN) rather than being guessed.
+    """
+    counterparty_name: Optional[str] = None
+    description: str
+    amount_inr: Optional[float] = None
+    due_date: Optional[date] = None
+    category: Optional[str] = None
+    confidence: float = 1.0
+    source_text: str = ""
+    is_explicit: bool = True
+
 

@@ -31,13 +31,14 @@ so the parser is designed for telegraphic Indian-English:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+from .database import compute_obligation_id
 
 logger = logging.getLogger(__name__)
 
@@ -137,11 +138,11 @@ INTENT_EXAMPLES: dict[str, list[str]] = {
 # Handles: ₹1.5L, 1 lakh, 20k, 20,000, ₹20000, 1.5 crore
 
 _AMOUNT_PATTERNS = [
-    (r"(?:₹|rs\.?\s*|inr\s*)?([\d,]+(?:\.\d+)?)\s*(?:cr|crore)\b", lambda m: float(m.group(1).replace(",", "")) * 1e7),
-    (r"(?:₹|rs\.?\s*|inr\s*)?([\d,]+(?:\.\d+)?)\s*(?:l|lakh|lac)\b",  lambda m: float(m.group(1).replace(",", "")) * 1e5),
-    (r"(?:₹|rs\.?\s*|inr\s*)?([\d,]+(?:\.\d+)?)\s*k\b",             lambda m: float(m.group(1).replace(",", "")) * 1e3),
-    (r"(?:₹|rs\.?\s*|inr\s*)([\d,]+(?:\.\d+)?)",                    lambda m: float(m.group(1).replace(",", ""))),
-    (r"\b([\d,]{4,}(?:\.\d+)?)\b",                                   lambda m: float(m.group(1).replace(",", ""))),
+    (r"(?:₹|rs\.?\s*|inr\s*)?([\d,]+(?:\.\d+)?)\s*(?:cr|crore|crores)\b", lambda m: round(float(m.group(1).replace(",", "")) * 1e7, 2)),
+    (r"(?:₹|rs\.?\s*|inr\s*)?([\d,]+(?:\.\d+)?)\s*(?:l|lakh|lakhs|lac|lacs)\b",  lambda m: round(float(m.group(1).replace(",", "")) * 1e5, 2)),
+    (r"(?:₹|rs\.?\s*|inr\s*)?([\d,]+(?:\.\d+)?)\s*k\b",             lambda m: round(float(m.group(1).replace(",", "")) * 1e3, 2)),
+    (r"(?:₹|rs\.?\s*|inr\s*)([\d,]+(?:\.\d+)?)",                    lambda m: round(float(m.group(1).replace(",", "")), 2)),
+    (r"\b([\d,]{4,}(?:\.\d+)?)\b",                                   lambda m: round(float(m.group(1).replace(",", "")), 2)),
 ]
 
 def extract_amounts(text: str) -> list[float]:
@@ -227,11 +228,13 @@ def parse_date(text: str, reference: Optional[date] = None) -> Optional[date]:
                 return next_month.replace(day=1) - timedelta(days=1)
             return ref + timedelta(days=offset)
 
-    # Weekday names
+    # Weekday names (ensure word boundaries so 'mon' does not match 'month' or 'money')
     for name, wd in _DAY_MAP.items():
-        if name in txt:
+        if re.search(r"\b" + name + r"\b", txt):
             days_ahead = wd - ref.weekday()
-            if days_ahead <= 0:
+            if f"next {name}" in txt:
+                days_ahead = days_ahead + 7 if days_ahead > 0 else days_ahead + 7
+            elif days_ahead < 0:
                 days_ahead += 7
             return ref + timedelta(days=days_ahead)
 
@@ -325,11 +328,6 @@ def infer_penalty_rate(category: str) -> float:
     }
     rates = _PARSER_CFG.get("default_penalty_rates", _DEFAULT_RATES)
     return rates.get(category, 0.0)
-
-
-def _obligation_id(counterparty: str, amount: float, due: Optional[date]) -> str:
-    payload = f"{counterparty}|{amount}|{due}"
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 # ─────────────────────────────────────────────
@@ -563,7 +561,7 @@ def parse_text_to_obligations(
         # ── Build description ────────────────
         description = seg.strip()[:120]
 
-        ob_id = _obligation_id(counterparty, amount, due_date)
+        ob_id = compute_obligation_id(counterparty, amount, due_date)
 
         obligations.append({
             "obligation_id":          ob_id,

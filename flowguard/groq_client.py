@@ -60,9 +60,9 @@ else:
 # MODEL CONSTANTS
 # ─────────────────────────────────────────────
 
-MODEL_PARSE    = "llama-3.1-8b-instant"     # Fast, cheap — input parsing (replaces decommissioned llama3-8b-8192)
-MODEL_FIXJSON  = "llama-3.1-8b-instant"    # Good at structured correction
-MODEL_NARRATE  = "llama-3.3-70b-versatile"  # Best quality — narration + email
+MODEL_PARSE    = "qwen/qwen3.8-27b"     # Fast, cheap — input parsing (Llama 3.x lineup decommissioned on Groq)
+MODEL_FIXJSON  = "qwen/qwen3.8-27b"     # Good at structured correction
+MODEL_NARRATE  = "qwen/qwen3.8-27b"     # Narration + email (gpt-oss models need larger max_tokens for hidden reasoning; qwen fits existing budgets reliably)
 _MODEL         = MODEL_PARSE                 # Alias used by file_ingest.py
 
 
@@ -208,10 +208,15 @@ STEP 3 — EXTRACT DATA (based on intent)
   • SECURED_LOAN, SALARY, RENT → NEGOTIABLE
   • UTILITY, TRADE_PAYABLE, OTHER → DEFERRABLE
 
-  DEFAULT DUE DATES (if not mentioned):
-  • STATUTORY → next 20th of month
-  • SALARY → 5 days from today
-  • All others → 7 days from today
+  DUE DATES & AMOUNTS (STRICT NO-HALLUCINATION RULES):
+  • NEVER invent or guess due dates. If due date is not explicitly mentioned or is unknown, set "due_date": null.
+  • NEVER invent or guess amounts. If amount is not explicitly mentioned or is unknown, set "amount_inr": null.
+  • Distinguish clearly between FACT (explicitly in text) and UNKNOWN (null).
+  • If the user says "GST is due soon", do NOT invent a date or amount — leave them null!
+  • A bare day-of-month ("due 20th", "due 5th", weekday names) means the NEXT occurrence of that
+    day at or after today's date. If that day-of-month has already passed in the current month,
+    resolve to that day in the FOLLOWING month — never output a date earlier than today unless the
+    user explicitly says it's already overdue/missed/late (e.g. "GST was due on the 5th, still unpaid").
 
   INDIAN NUMBER FORMATS (handle ALL of these):
   • 2L = 2 lakh = 200000
@@ -236,14 +241,15 @@ STEP 3 — EXTRACT DATA (based on intent)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STEP 4 — COMPUTE INLINE STATS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Always compute these stats from what the user said. Use 0/null if unknown.
+Compute stats ONLY from explicitly stated facts in the user's message.
+Use null if unknown. Never invent numbers.
 
   stats.obligations_this_message → count of obligations extracted right now
-  stats.total_amount_due_inr     → sum of all obligation amounts in this message
-  stats.cash_balance_inr         → cash the user HAS (from this message or context)
-  stats.estimated_shortfall_inr  → max(0, total_amount_due - cash_balance)
+  stats.total_amount_due_inr     → sum of valid numerical obligation amounts in this message (or null)
+  stats.cash_balance_inr         → cash the user HAS (null if unknown)
+  stats.estimated_shortfall_inr  → shortfall if known, else null
   stats.critical_count           → count of STATUTORY + SECURED_LOAN obligations
-  stats.days_to_critical         → days from today to nearest STATUTORY/SECURED_LOAN due date (null if none)
+  stats.days_to_critical         → days from today to nearest STATUTORY/SECURED_LOAN due date (null if none/unknown)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STEP 5 — GENERATE BOT REPLY (ALWAYS INCLUDE ₹ NUMBERS)
@@ -431,15 +437,15 @@ def groq_fix_json(
 # ─────────────────────────────────────────────
 
 _COT_SYSTEM = """You are a senior CFO advisor explaining machine-computed payment decisions to an Indian MSME owner.
-You receive structured facts — the math is already done. Your job is to explain it naturally.
+You receive structured facts — the numerical scoring, priority ranking, and actions have ALREADY been computed deterministically by the Python scoring engine.
+Your job is to explain the decision clearly and professionally without altering any numbers or actions.
 
-INDIAN REGULATORY CONTEXT (use this for accurate explanations):
-- GST/TDS/PF: Missing payment = 18% annual interest + Rs.100/day + possible prosecution. Cannot defer.
-- EMI/Bank loan: Overdue = NPA classification in 90 days, credit score harm, asset seizure risk.
-- Salary: Delay = Labour Court complaint under Payment of Wages Act. Rs.25,000 max penalty.
-- Rent: Overdue = eviction notice, forfeiture of security deposit.
-- Supplier: Supply stop, credit line revoked. No legal penalty but operational shutdown risk.
-- Utility: Disconnection after 15-30 days. Reconnection fee + downtime cost.
+REGULATORY ACCURACY RULES:
+- If a "regulatory_context" string is provided in the facts, cite it accurately.
+- If regulatory details are absent or unknown, state: "Regulatory consequence could not be verified."
+- NEVER invent arbitrary statutory interest rates, penalties, or legal claims not provided in the input facts.
+- Do NOT present simplified assumptions (e.g. universal criminal prosecution, universal ₹25,000 penalties) as absolute facts.
+- State that statutory guidelines depend on specific registrations, thresholds, and authorities.
 
 ACTION MEANING:
 - PAY: Highest urgency — settle immediately from available cash.
@@ -561,9 +567,15 @@ def groq_draft_email(
 
 
 # ─────────────────────────────────────────────
-# 5. VISION OCR — llama-3.2-11b-vision-preview
+# 5. VISION OCR
 # ─────────────────────────────────────────────
-
+# NOTE: as of 2026-09, Groq's hosted catalog for this account has no
+# vision-capable (image-input) model at all — the account's /models list
+# returns only text/audio models (openai/gpt-oss-*, qwen, whisper, etc.).
+# Both constants below will 404 until Groq (re)hosts a vision model.
+# groq_vision_ocr() already degrades gracefully (returns None → caller
+# reports "no text extracted") rather than crashing, so image upload is a
+# known, non-fatal degraded feature until this changes.
 MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
 _VISION_FALLBACK = "llama-3.2-90b-vision-preview"  # fallback if primary fails
 

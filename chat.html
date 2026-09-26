@@ -282,7 +282,8 @@ function addCard(data){
   else if(er.days_to_zero>7)pill=`<span class="pill warn">⚠ ${er.days_to_zero}d left</span>`;
   else pill=`<span class="pill crit">🔥 ${er.days_to_zero}d left</span>`;
 
-  const items=dec.map(d=>`<div class="item ${d.score_band||'LOW'}"><div class="item-info"><div class="item-name">${esc(d.counterparty_name)}</div><div class="item-meta">₹${(d.amount_inr||0).toLocaleString('en-IN')} · Due ${d.due_date||'—'} · CS ${(d.consequence_score||0).toFixed(1)}</div></div><span class="tag ${d.action||'DEFER'}">${d.action||'DEFER'}</span></div>`).join('');
+  const BAND_CLASS={CRITICAL:'CRITICAL',HIGH:'HIGH',MEDIUM:'MEDIUM',LOW:'LOW'};
+  const items=dec.map(d=>`<div class="item ${BAND_CLASS[d.score_band]||'LOW'}"><div class="item-info"><div class="item-name">${esc(d.counterparty_name)}</div><div class="item-meta">₹${(d.amount_inr||0).toLocaleString('en-IN')} · Due ${d.due_date||'—'} · CS ${(d.consequence_score||0).toFixed(1)}</div></div><span class="tag ${d.action||'DEFER'}">${d.action||'DEFER'}</span></div>`).join('');
   const foot=er.cash_shortfall_inr>0?`<span class="red">Shortfall ₹${er.cash_shortfall_inr.toLocaleString('en-IN')}</span>`:`<span class="grn">Fully solvent</span>`;
 
   $('chat').insertAdjacentHTML('beforeend',`<div class="row bot"><div class="card"><div class="card-h"><span>FlowGuard Report</span>${pill}</div><div class="card-b">${items}</div><div class="card-f"><span>Cash ₹${(er.available_cash_inr||0).toLocaleString('en-IN')}</span>${foot}</div></div><div class="time">${ts()}</div></div>`);
