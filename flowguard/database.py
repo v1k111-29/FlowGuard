@@ -63,7 +63,11 @@ TX_PREFIX: dict[str, str] = {
 }
 
 
-def generate_txn_ref_id(medium: str, external_ref: Optional[str] = None) -> str:
+DEFAULT_USER_ID = "default"
+
+
+def generate_txn_ref_id(medium: str, external_ref: Optional[str] = None,
+                        user_id: str = DEFAULT_USER_ID) -> str:
     """
     Build a canonical, prefixed transaction reference ID.
 
@@ -73,14 +77,21 @@ def generate_txn_ref_id(medium: str, external_ref: Optional[str] = None) -> str:
 
     For instruments with no external ref (liquid cash, or truly unknown),
     we generate a unique FG-<8-char uuid> so the record is still deduplicated.
+
+    Non-default user_id is prefixed so the same external_ref submitted by two
+    different tenants doesn't collide on the ref_id primary key.
     """
     prefix = TX_PREFIX.get(medium, "FG")
     if external_ref and external_ref.strip():
         clean = external_ref.strip().upper().replace(" ", "")
-        return f"{prefix}-{clean}"
-    # Auto-generate when no external ref is available
-    short_uid = uuid.uuid4().hex[:8].upper()
-    return f"{prefix}-{short_uid}"
+        ref = f"{prefix}-{clean}"
+    else:
+        # Auto-generate when no external ref is available
+        short_uid = uuid.uuid4().hex[:8].upper()
+        ref = f"{prefix}-{short_uid}"
+    if user_id and user_id != DEFAULT_USER_ID:
+        return f"{user_id}:{ref}"
+    return ref
 
 
 from sqlalchemy import (
@@ -98,7 +109,10 @@ logger = logging.getLogger(__name__)
 # DATABASE PATH & ENGINE
 # ─────────────────────────────────────────────
 
-_DB_PATH = Path(__file__).resolve().parent.parent / "flowguard.db"
+import os
+
+_DB_PATH_ENV = os.getenv("FLOWGUARD_DB_PATH", "")
+_DB_PATH = Path(_DB_PATH_ENV) if _DB_PATH_ENV else Path(__file__).resolve().parent.parent / "flowguard.db"
 _DATABASE_URL = f"sqlite:///{_DB_PATH}"
 
 engine = create_engine(
@@ -131,18 +145,26 @@ class Base(DeclarativeBase):
 # ─────────────────────────────────────────────
 
 def compute_obligation_id(
-    counterparty: str, amount: float, due_date: date
+    counterparty: str, amount: float, due_date: date,
+    user_id: str = DEFAULT_USER_ID,
 ) -> str:
     """
     SHA-256 based dedup key.
     Two obligations with the same party + amount + due_date from ANY source
     (chat, CSV, invoice image, PDF) are treated as the SAME obligation.
+
+    Scoped per user_id (a Telegram chat_id, etc.) so two tenants with an
+    identical obligation don't collide. The default tenant's hash omits the
+    user_id suffix so pre-existing rows (chat.html, single-tenant use) keep
+    resolving to the same id.
     """
     normalized = (
         f"{counterparty.strip().lower()}"
         f"|{amount:.2f}"
         f"|{due_date.isoformat()}"
     )
+    if user_id and user_id != DEFAULT_USER_ID:
+        normalized += f"|{user_id}"
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
@@ -159,6 +181,7 @@ class ObligationRow(Base):
     __tablename__ = "obligations"
 
     obligation_id       = Column(String(16), primary_key=True)
+    user_id             = Column(String(64), nullable=False, default=DEFAULT_USER_ID, index=True)
     counterparty_name   = Column(String(200), nullable=False, index=True)
     description         = Column(Text, default="")
     amount_inr          = Column(Float, nullable=False)
@@ -208,6 +231,7 @@ class CashSnapshotRow(Base):
     __tablename__ = "cash_snapshots"
 
     snapshot_id         = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id             = Column(String(64), nullable=False, default=DEFAULT_USER_ID, index=True)
     available_cash_inr  = Column(Float, nullable=False)
     as_of_date          = Column(Date, nullable=False)
     is_verified         = Column(Boolean, default=False)
@@ -223,6 +247,7 @@ class EngineRunRow(Base):
     __tablename__ = "engine_runs"
 
     run_id              = Column(String(36), primary_key=True)
+    user_id             = Column(String(64), nullable=False, default=DEFAULT_USER_ID, index=True)
     as_of_date          = Column(Date, nullable=False)
     available_cash_inr  = Column(Float, nullable=False)
     total_obligations   = Column(Float, nullable=False)
@@ -277,6 +302,7 @@ class FileImportRow(Base):
     __tablename__ = "file_imports"
 
     file_hash           = Column(String(64), primary_key=True)
+    user_id             = Column(String(64), primary_key=True, default=DEFAULT_USER_ID)
     filename            = Column(String(500), nullable=False)
     file_type           = Column(String(10), nullable=False)  # CSV|PDF|IMAGE
     file_size_bytes     = Column(Integer, nullable=False)
@@ -303,6 +329,7 @@ class TransactionRow(Base):
     __tablename__ = "transactions"
 
     ref_id          = Column(String(80), primary_key=True)  # e.g.  U-9876543210
+    user_id         = Column(String(64), nullable=False, default=DEFAULT_USER_ID, index=True)
     medium          = Column(String(20), nullable=False)     # TxMedium value
     direction       = Column(String(3),  nullable=False)     # IN | OUT
     amount_inr      = Column(Float,      nullable=False)
@@ -343,7 +370,7 @@ class TransactionRow(Base):
 class UserProfileRow(Base):
     __tablename__ = "user_profile"
 
-    id                  = Column(Integer, primary_key=True, default=1) # Single user for now
+    user_id             = Column(String(64), primary_key=True, default=DEFAULT_USER_ID)
     full_name           = Column(String(200), nullable=True)
     business_name       = Column(String(200), nullable=True)
     industry            = Column(String(100), nullable=True)
@@ -388,18 +415,20 @@ def get_db() -> Session:
 
 
 def upsert_obligation(db: Session, data: dict, source_type: str = "CHAT",
-                      file_hash: Optional[str] = None) -> tuple[ObligationRow, bool]:
+                      file_hash: Optional[str] = None,
+                      user_id: str = DEFAULT_USER_ID) -> tuple[ObligationRow, bool]:
     """
     Insert or update an obligation. Returns (row, is_new).
-    Uses obligation_id as the dedup key.
+    Uses obligation_id as the dedup key, scoped to user_id.
     """
     oid = data.get("obligation_id") or compute_obligation_id(
         data["counterparty_name"], data["amount_inr"],
         data["due_date"] if isinstance(data["due_date"], date)
-        else date.fromisoformat(str(data["due_date"]))
+        else date.fromisoformat(str(data["due_date"])),
+        user_id,
     )
 
-    existing = db.query(ObligationRow).filter_by(obligation_id=oid).first()
+    existing = db.query(ObligationRow).filter_by(obligation_id=oid, user_id=user_id).first()
     if existing:
         # Update mutable fields — map input dict keys to ORM column names
         _field_map = {
@@ -424,6 +453,7 @@ def upsert_obligation(db: Session, data: dict, source_type: str = "CHAT",
 
     row = ObligationRow(
         obligation_id=oid,
+        user_id=user_id,
         counterparty_name=data["counterparty_name"],
         description=data.get("description", ""),
         amount_inr=data["amount_inr"],
@@ -447,10 +477,12 @@ def upsert_obligation(db: Session, data: dict, source_type: str = "CHAT",
 
 def store_engine_run(db: Session, run_id: str, engine_result: dict,
                      raw_input: Optional[str] = None,
-                     source_type: str = "CHAT") -> EngineRunRow:
+                     source_type: str = "CHAT",
+                     user_id: str = DEFAULT_USER_ID) -> EngineRunRow:
     """Persist a full engine run + decisions."""
     run = EngineRunRow(
         run_id=run_id,
+        user_id=user_id,
         as_of_date=date.today(),
         available_cash_inr=engine_result.get("available_cash_inr", 0),
         total_obligations=engine_result.get("total_obligations_inr", 0),
@@ -483,18 +515,21 @@ def store_engine_run(db: Session, run_id: str, engine_result: dict,
     return run
 
 
-def check_file_imported(db: Session, file_hash: str) -> Optional[FileImportRow]:
-    """Check if a file was already imported."""
-    return db.query(FileImportRow).filter_by(file_hash=file_hash).first()
+def check_file_imported(db: Session, file_hash: str,
+                        user_id: str = DEFAULT_USER_ID) -> Optional[FileImportRow]:
+    """Check if this user already imported this exact file."""
+    return db.query(FileImportRow).filter_by(file_hash=file_hash, user_id=user_id).first()
 
 
 def record_file_import(db: Session, file_hash: str, filename: str,
                        file_type: str, file_size: int,
                        found: int, new: int, updated: int,
-                       raw_text: Optional[str] = None) -> FileImportRow:
+                       raw_text: Optional[str] = None,
+                       user_id: str = DEFAULT_USER_ID) -> FileImportRow:
     """Record a file import for dedup tracking."""
     row = FileImportRow(
         file_hash=file_hash,
+        user_id=user_id,
         filename=filename,
         file_type=file_type,
         file_size_bytes=file_size,
@@ -509,9 +544,11 @@ def record_file_import(db: Session, file_hash: str, filename: str,
 
 
 def record_cash_snapshot(db: Session, available_cash_inr: float, as_of_date: date,
-                         source_type: str = "CHAT", is_verified: bool = False) -> CashSnapshotRow:
+                         source_type: str = "CHAT", is_verified: bool = False,
+                         user_id: str = DEFAULT_USER_ID) -> CashSnapshotRow:
     """Persist a self-reported or verified cash balance snapshot."""
     row = CashSnapshotRow(
+        user_id=user_id,
         available_cash_inr=available_cash_inr,
         as_of_date=as_of_date,
         is_verified=is_verified,
@@ -523,19 +560,21 @@ def record_cash_snapshot(db: Session, available_cash_inr: float, as_of_date: dat
     return row
 
 
-def get_latest_cash_snapshot(db: Session) -> Optional[CashSnapshotRow]:
-    """Fetch the most recently recorded cash snapshot, if any."""
+def get_latest_cash_snapshot(db: Session, user_id: str = DEFAULT_USER_ID) -> Optional[CashSnapshotRow]:
+    """Fetch the most recently recorded cash snapshot for this user, if any."""
     return (
         db.query(CashSnapshotRow)
+        .filter_by(user_id=user_id)
         .order_by(CashSnapshotRow.created_at.desc())
         .first()
     )
 
 
 def get_all_obligations(db: Session, category: Optional[str] = None,
-                        active_only: bool = True) -> list[ObligationRow]:
-    """Fetch all obligations, optionally filtered."""
-    q = db.query(ObligationRow)
+                        active_only: bool = True,
+                        user_id: str = DEFAULT_USER_ID) -> list[ObligationRow]:
+    """Fetch all obligations for this user, optionally filtered."""
+    q = db.query(ObligationRow).filter(ObligationRow.user_id == user_id)
     if category:
         q = q.filter(ObligationRow.category == category)
     if active_only:
@@ -543,19 +582,22 @@ def get_all_obligations(db: Session, category: Optional[str] = None,
     return q.order_by(ObligationRow.due_date.asc()).all()
 
 
-def get_run_history(db: Session, limit: int = 20) -> list[EngineRunRow]:
-    """Fetch recent engine runs."""
+def get_run_history(db: Session, limit: int = 20,
+                    user_id: str = DEFAULT_USER_ID) -> list[EngineRunRow]:
+    """Fetch recent engine runs for this user."""
     return (
         db.query(EngineRunRow)
+        .filter_by(user_id=user_id)
         .order_by(EngineRunRow.computed_at.desc())
         .limit(limit)
         .all()
     )
 
 
-def delete_obligation(db: Session, obligation_id: str) -> bool:
-    """Delete an obligation by ID. Returns True if found."""
-    row = db.query(ObligationRow).filter_by(obligation_id=obligation_id).first()
+def delete_obligation(db: Session, obligation_id: str,
+                      user_id: str = DEFAULT_USER_ID) -> bool:
+    """Delete an obligation by ID (scoped to user_id). Returns True if found."""
+    row = db.query(ObligationRow).filter_by(obligation_id=obligation_id, user_id=user_id).first()
     if row:
         db.delete(row)
         db.commit()
@@ -579,6 +621,7 @@ def record_transaction(
     external_ref: Optional[str] = None,
     source_type: str = "CHAT",
     source_file_hash: Optional[str] = None,
+    user_id: str = DEFAULT_USER_ID,
 ) -> tuple[TransactionRow, bool]:
     """
     Insert a transaction.
@@ -587,13 +630,14 @@ def record_transaction(
 
     Returns (row, is_new).
     """
-    ref_id = generate_txn_ref_id(medium, external_ref)
+    ref_id = generate_txn_ref_id(medium, external_ref, user_id)
     existing = db.query(TransactionRow).filter_by(ref_id=ref_id).first()
     if existing:
         return existing, False   # duplicate – already recorded
 
     row = TransactionRow(
         ref_id=ref_id,
+        user_id=user_id,
         medium=medium,
         direction=direction.upper(),
         amount_inr=amount_inr,
@@ -618,9 +662,10 @@ def get_transactions(
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
     limit: int = 200,
+    user_id: str = DEFAULT_USER_ID,
 ) -> list[TransactionRow]:
-    """Fetch transactions with optional filters."""
-    q = db.query(TransactionRow)
+    """Fetch transactions for this user, with optional filters."""
+    q = db.query(TransactionRow).filter(TransactionRow.user_id == user_id)
     if direction:
         q = q.filter(TransactionRow.direction == direction.upper())
     if medium:
@@ -633,12 +678,13 @@ def get_transactions(
 
 
 def get_tx_summary(db: Session, from_date: Optional[date] = None,
-                   to_date: Optional[date] = None) -> dict:
+                   to_date: Optional[date] = None,
+                   user_id: str = DEFAULT_USER_ID) -> dict:
     """
     Returns total IN, total OUT and net balance for a date range.
     Useful for the engine to pull verified cash movements.
     """
-    txns = get_transactions(db, from_date=from_date, to_date=to_date, limit=10000)
+    txns = get_transactions(db, from_date=from_date, to_date=to_date, limit=10000, user_id=user_id)
     total_in  = sum(t.amount_inr for t in txns if t.direction == "IN")
     total_out = sum(t.amount_inr for t in txns if t.direction == "OUT")
     by_medium: dict[str, dict] = {}
@@ -674,16 +720,16 @@ def delete_transaction(db: Session, ref_id: str) -> bool:
 # USER PROFILE HELPERS
 # ─────────────────────────────────────────────
 
-def get_user_profile(db: Session) -> Optional[UserProfileRow]:
-    """Fetch the single user profile."""
-    return db.query(UserProfileRow).filter_by(id=1).first()
+def get_user_profile(db: Session, user_id: str = DEFAULT_USER_ID) -> Optional[UserProfileRow]:
+    """Fetch a user's profile."""
+    return db.query(UserProfileRow).filter_by(user_id=user_id).first()
 
 
-def update_user_profile(db: Session, data: dict) -> UserProfileRow:
-    """Create or update the user profile."""
-    profile = db.query(UserProfileRow).filter_by(id=1).first()
+def update_user_profile(db: Session, data: dict, user_id: str = DEFAULT_USER_ID) -> UserProfileRow:
+    """Create or update a user's profile."""
+    profile = db.query(UserProfileRow).filter_by(user_id=user_id).first()
     if not profile:
-        profile = UserProfileRow(id=1)
+        profile = UserProfileRow(user_id=user_id)
         db.add(profile)
 
     for key in ("full_name", "business_name", "industry", 

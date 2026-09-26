@@ -89,6 +89,7 @@ from .database import (
     record_file_import,
     record_transaction,
     generate_txn_ref_id,
+    DEFAULT_USER_ID,
 )
 from .groq_client import (
     groq_parse_input,
@@ -271,7 +272,7 @@ def _parse_amount(val: str) -> Optional[float]:
 
 def _validate_and_store_obligations(
     db, obligations_raw: list[dict], source_type: str,
-    file_hash: str, result: ImportResult
+    file_hash: str, result: ImportResult, user_id: str = DEFAULT_USER_ID
 ):
     """Validate each obligation with Pydantic, compute dedup key, and UPSERT."""
     for raw_ob in obligations_raw:
@@ -279,9 +280,9 @@ def _validate_and_store_obligations(
             validated = ValidatedObligation(**raw_ob)
             ob = validated.model_dump()   # Pydantic v2: was .dict()
             ob["obligation_id"] = compute_obligation_id(
-                ob["counterparty_name"], ob["amount_inr"], ob["due_date"]
+                ob["counterparty_name"], ob["amount_inr"], ob["due_date"], user_id
             )
-            row, is_new = upsert_obligation(db, ob, source_type, file_hash)
+            row, is_new = upsert_obligation(db, ob, source_type, file_hash, user_id)
             result.obligations.append(ob)
             if is_new:
                 result.new_count += 1
@@ -297,7 +298,7 @@ def _validate_and_store_obligations(
 
 def _validate_and_store_transactions(
     db, transactions_raw: list[dict], source_type: str,
-    file_hash: str, result: ImportResult
+    file_hash: str, result: ImportResult, user_id: str = DEFAULT_USER_ID
 ):
     """Validate each transaction with Pydantic, generate ref_id, and store."""
     for raw_tx in transactions_raw:
@@ -314,6 +315,7 @@ def _validate_and_store_transactions(
                 external_ref=validated.external_ref,
                 source_type=source_type,
                 source_file_hash=file_hash,
+                user_id=user_id,
             )
             result.transactions.append(row.to_dict())
         except Exception as e:
@@ -429,7 +431,8 @@ _COL_MAP = {
 }
 
 
-def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
+def import_csv(content: bytes, filename: str = "upload.csv",
+               user_id: str = DEFAULT_USER_ID) -> ImportResult:
     """Import obligations/transactions from a CSV or XLSX file using Pandas."""
     result = ImportResult(filename, "CSV")
     file_hash = compute_file_hash(content)
@@ -437,7 +440,7 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
 
     db = SessionLocal()
     try:
-        existing = check_file_imported(db, file_hash)
+        existing = check_file_imported(db, file_hash, user_id)
         if existing:
             result.skipped_duplicate = True
             result.success = True
@@ -479,16 +482,16 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
                     if structured:
                         _validate_and_store_obligations(
                             db, structured.get("obligations", []),
-                            "CSV", file_hash, result
+                            "CSV", file_hash, result, user_id
                         )
                         _validate_and_store_transactions(
                             db, structured.get("transactions", []),
-                            "CSV", file_hash, result
+                            "CSV", file_hash, result, user_id
                         )
                         result.success = True
                         record_file_import(db, file_hash, filename, "CSV", len(content),
                                            len(result.obligations), result.new_count,
-                                           result.updated_count, raw_text[:2000])
+                                           result.updated_count, raw_text[:2000], user_id)
                         return result
                 result.error = (
                     "CSV/Excel must have columns for counterparty (e.g. 'vendor', 'party', 'name') "
@@ -537,10 +540,10 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
                 if is_txn_file:
                     row_dict.setdefault("txn_date", row_dict.get("due_date", date.today()))
                     row_dict.setdefault("counterparty", row_dict.get("counterparty_name", "Unknown"))
-                    _validate_and_store_transactions(db, [row_dict], "CSV", file_hash, result)
+                    _validate_and_store_transactions(db, [row_dict], "CSV", file_hash, result, user_id)
                 else:
                     row_dict.setdefault("category", "OTHER")
-                    _validate_and_store_obligations(db, [row_dict], "CSV", file_hash, result)
+                    _validate_and_store_obligations(db, [row_dict], "CSV", file_hash, result, user_id)
 
         else:
             # Fallback: stdlib csv + Groq (pandas not available)
@@ -552,11 +555,11 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
                 if structured:
                     _validate_and_store_obligations(
                         db, structured.get("obligations", []),
-                        "CSV", file_hash, result
+                        "CSV", file_hash, result, user_id
                     )
                     _validate_and_store_transactions(
                         db, structured.get("transactions", []),
-                        "CSV", file_hash, result
+                        "CSV", file_hash, result, user_id
                     )
 
         if len(result.obligations) > 0 or len(result.transactions) > 0:
@@ -568,7 +571,7 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
                 preview_text = (text[:2000] if 'text' in dir() and text else content.decode("utf-8-sig", errors="replace")[:2000])
             record_file_import(db, file_hash, filename, result.file_type, len(content),
                                len(result.obligations), result.new_count,
-                               result.updated_count, preview_text)
+                               result.updated_count, preview_text, user_id)
         else:
             result.success = False
             result.error = result.error or "No valid obligations or transactions found in CSV/Excel"
@@ -586,7 +589,8 @@ def import_csv(content: bytes, filename: str = "upload.csv") -> ImportResult:
 # 2. PDF IMPORT — pdfplumber + Camelot
 # ─────────────────────────────────────────────
 
-def import_pdf(content: bytes, filename: str = "upload.pdf") -> ImportResult:
+def import_pdf(content: bytes, filename: str = "upload.pdf",
+               user_id: str = DEFAULT_USER_ID) -> ImportResult:
     """Extract text + tables from PDF → Groq LLM → validate → store."""
     result = ImportResult(filename, "PDF")
 
@@ -599,7 +603,7 @@ def import_pdf(content: bytes, filename: str = "upload.pdf") -> ImportResult:
 
     db = SessionLocal()
     try:
-        existing = check_file_imported(db, file_hash)
+        existing = check_file_imported(db, file_hash, user_id)
         if existing:
             result.skipped_duplicate = True
             result.success = True
@@ -678,22 +682,22 @@ def import_pdf(content: bytes, filename: str = "upload.pdf") -> ImportResult:
         if structured:
             _validate_and_store_obligations(
                 db, structured.get("obligations", []),
-                "PDF", file_hash, result
+                "PDF", file_hash, result, user_id
             )
             _validate_and_store_transactions(
                 db, structured.get("transactions", []),
-                "PDF", file_hash, result
+                "PDF", file_hash, result, user_id
             )
         else:
             # Fallback: regex parser (obligations only)
             parsed_obs, _ = parse_text_to_obligations(full_text)
-            _validate_and_store_obligations(db, parsed_obs, "PDF", file_hash, result)
+            _validate_and_store_obligations(db, parsed_obs, "PDF", file_hash, result, user_id)
 
         if len(result.obligations) > 0 or len(result.transactions) > 0:
             result.success = True
             record_file_import(db, file_hash, filename, "PDF", len(content),
                                len(result.obligations), result.new_count,
-                               result.updated_count, full_text[:5000])
+                               result.updated_count, full_text[:5000], user_id)
         else:
             result.success = False
             result.error = "No valid obligations or transactions found in PDF"
@@ -711,7 +715,8 @@ def import_pdf(content: bytes, filename: str = "upload.pdf") -> ImportResult:
 # 3. OCR IMAGE IMPORT — PaddleOCR
 # ─────────────────────────────────────────────
 
-def import_image(content: bytes, filename: str = "upload.jpg") -> ImportResult:
+def import_image(content: bytes, filename: str = "upload.jpg",
+                 user_id: str = DEFAULT_USER_ID) -> ImportResult:
     """OCR via Groq Vision API → Groq LLM → validate → store."""
     result = ImportResult(filename, "IMAGE")
 
@@ -724,7 +729,7 @@ def import_image(content: bytes, filename: str = "upload.jpg") -> ImportResult:
 
     db = SessionLocal()
     try:
-        existing = check_file_imported(db, file_hash)
+        existing = check_file_imported(db, file_hash, user_id)
         if existing:
             result.skipped_duplicate = True
             result.success = True
@@ -769,22 +774,22 @@ def import_image(content: bytes, filename: str = "upload.jpg") -> ImportResult:
         if structured:
             _validate_and_store_obligations(
                 db, structured.get("obligations", []),
-                "IMAGE", file_hash, result
+                "IMAGE", file_hash, result, user_id
             )
             _validate_and_store_transactions(
                 db, structured.get("transactions", []),
-                "IMAGE", file_hash, result
+                "IMAGE", file_hash, result, user_id
             )
         else:
             # Fallback: regex parser
             parsed_obs, _ = parse_text_to_obligations(raw_text)
-            _validate_and_store_obligations(db, parsed_obs, "IMAGE", file_hash, result)
+            _validate_and_store_obligations(db, parsed_obs, "IMAGE", file_hash, result, user_id)
 
         if len(result.obligations) > 0 or len(result.transactions) > 0:
             result.success = True
             record_file_import(db, file_hash, filename, "IMAGE", len(content),
                                len(result.obligations), result.new_count,
-                               result.updated_count, raw_text[:5000])
+                               result.updated_count, raw_text[:5000], user_id)
         else:
             result.success = False
             result.error = "No valid obligations or transactions found in image"

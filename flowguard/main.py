@@ -47,12 +47,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -122,6 +123,7 @@ from .database import (
     TxMedium,
     TX_PREFIX,
     compute_obligation_id,
+    DEFAULT_USER_ID,
 )
 from .file_ingest import (
     import_csv,
@@ -243,11 +245,29 @@ class HealthResponse(BaseModel):
     timestamp: datetime
     groq: dict = Field(default_factory=dict)
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+FLOWGUARD_PUBLIC_URL = os.getenv("FLOWGUARD_PUBLIC_URL", "")
+
+
 @asynccontextmanager
 async def lifespan(app):
     init_db()
     logger.info("FlowGuard database initialized")
-    yield
+
+    if TELEGRAM_BOT_TOKEN and FLOWGUARD_PUBLIC_URL:
+        from .telegram_bot import start_webhook, stop_webhook
+        await start_webhook(FLOWGUARD_PUBLIC_URL)
+        yield
+        await stop_webhook()
+    else:
+        if TELEGRAM_BOT_TOKEN:
+            logger.warning(
+                "TELEGRAM_BOT_TOKEN set but FLOWGUARD_PUBLIC_URL missing — "
+                "Telegram webhook NOT registered. Set FLOWGUARD_PUBLIC_URL to "
+                "this service's public HTTPS URL to enable the bot."
+            )
+        yield
 
 # ─────────────────────────────────────────────
 # APP
@@ -309,7 +329,8 @@ def _regex_guess_intent(raw_text: str, ref: date) -> str:
     return "STATUS"
 
 
-def _try_groq_parse(raw_text: str, ref: date) -> tuple[Optional[ScoreRequest], dict]:
+def _try_groq_parse(raw_text: str, ref: date,
+                    user_id: str = DEFAULT_USER_ID) -> tuple[Optional[ScoreRequest], dict]:
     """Attempt to parse input via Groq LLM (Layer 2).
     Returns (ScoreRequest | None, metadata_dict).
     metadata_dict always has: intent, bot_reply, filter_query
@@ -369,7 +390,7 @@ def _try_groq_parse(raw_text: str, ref: date) -> tuple[Optional[ScoreRequest], d
             flexibility = flex_str if flex_str in ("FIXED", "NEGOTIABLE", "DEFERRABLE") else infer_flexibility(desc, category)
             penalty_rate = infer_penalty_rate(category)
 
-            oid = compute_obligation_id(cparty, amt, due_date_val)
+            oid = compute_obligation_id(cparty, amt, due_date_val, user_id)
 
             ob = Obligation(
                 obligation_id=oid,
@@ -407,7 +428,8 @@ def _try_groq_parse(raw_text: str, ref: date) -> tuple[Optional[ScoreRequest], d
     return ScoreRequest(obligations=obligations, cash_position=cash_position), meta
 
 
-def _parse_raw_to_score_request(req: NLPParseRequest) -> tuple[ScoreRequest, dict]:
+def _parse_raw_to_score_request(req: NLPParseRequest,
+                                user_id: str = DEFAULT_USER_ID) -> tuple[ScoreRequest, dict]:
     """Convert NLPParseRequest → (ScoreRequest, groq_meta).
 
     Pipeline: Groq (llama3-8b) → Pydantic validate → fallback to regex parser.
@@ -417,7 +439,7 @@ def _parse_raw_to_score_request(req: NLPParseRequest) -> tuple[ScoreRequest, dic
     meta = {"intent": "STATUS", "bot_reply": "", "filter_query": {}}
 
     # Layer 2: Try Groq parsing first
-    groq_req, meta = _try_groq_parse(req.raw_text, ref)
+    groq_req, meta = _try_groq_parse(req.raw_text, ref, user_id)
     if groq_req is not None and groq_req.obligations:
         logger.info("Using Groq-parsed input (%d obligations, intent=%s)",
                     len(groq_req.obligations), meta["intent"])
@@ -515,6 +537,21 @@ async def health():
         groq=get_groq_status(),
     )
     return resp
+
+
+@app.post("/telegram/webhook", include_in_schema=False)
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(None),
+):
+    """Telegram calls this with each update when the webhook is registered
+    (see lifespan startup). Not used in local polling-mode dev."""
+    if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret token")
+    from .telegram_bot import process_update
+    payload = await request.json()
+    await process_update(payload)
+    return {"ok": True}
 
 
 @app.post(
@@ -618,17 +655,20 @@ async def narrate(req: NLPNarrateRequest) -> NarrateResponse:
         "The WhatsApp bot should POST this text here and send back `narrative`."
     ),
 )
-async def pipeline(req: NLPParseRequest):
+async def pipeline(req: NLPParseRequest, user_id: str = DEFAULT_USER_ID):
     """
     Intent-routed pipeline:
       INGEST  → record obligations, return affirmative bot_reply.
       STATUS  → run the full scoring engine, return decisions + narrative.
       FILTER  → query transactions/obligations DB, return matching records as JSON.
+
+    `user_id` scopes obligations/cash/transactions to a tenant (e.g. a
+    Telegram chat_id). Omit it to use the single default tenant (chat.html).
     """
     ref = get_ist_today()
 
     # ── Run Groq to classify intent and extract data ──
-    groq_req, meta = _try_groq_parse(req.raw_text, ref)
+    groq_req, meta = _try_groq_parse(req.raw_text, ref, user_id)
     intent      = meta.get("intent", "STATUS")
     bot_reply   = meta.get("bot_reply", "")
     filter_q    = meta.get("filter_query", {})
@@ -652,7 +692,7 @@ async def pipeline(req: NLPParseRequest):
                         "obligation_id":     ob.obligation_id,
                         "penalty_rate_annual_pct": ob.penalty_rate_annual_pct,  # ← ADD
                     }
-                    row, is_new = upsert_obligation(db, ob_dict, "CHAT", None)
+                    row, is_new = upsert_obligation(db, ob_dict, "CHAT", None, user_id)
                     stored_obs.append({
                         "ref": ob.obligation_id,
                         "counterparty": ob.counterparty_name,
@@ -664,7 +704,7 @@ async def pipeline(req: NLPParseRequest):
                 # INGEST still records data instead of silently doing nothing.
                 obligation_dicts, cash_inr = parse_text_to_obligations(req.raw_text, ref)
                 for ob_dict in obligation_dicts:
-                    row, is_new = upsert_obligation(db, ob_dict, "CHAT", None)
+                    row, is_new = upsert_obligation(db, ob_dict, "CHAT", None, user_id)
                     stored_obs.append({
                         "ref": ob_dict["obligation_id"],
                         "counterparty": ob_dict["counterparty_name"],
@@ -677,7 +717,7 @@ async def pipeline(req: NLPParseRequest):
             # Cash balance can be reported standalone (no obligations in the
             # same message) — persist it so a later STATUS query can find it.
             if cash_amt and cash_amt > 0:
-                snap = record_cash_snapshot(db, cash_amt, ref, source_type="CHAT", is_verified=False)
+                snap = record_cash_snapshot(db, cash_amt, ref, source_type="CHAT", is_verified=False, user_id=user_id)
                 cash_recorded = snap.available_cash_inr
         finally:
             db.close()
@@ -709,6 +749,7 @@ async def pipeline(req: NLPParseRequest):
                 from_date=df_from,
                 to_date=df_to,
                 limit=200,
+                user_id=user_id,
             )
             # Further filter by counterparty name if specified
             if party:
@@ -722,6 +763,7 @@ async def pipeline(req: NLPParseRequest):
                     db,
                     category=fq.get("category"),
                     active_only=False,
+                    user_id=user_id,
                 )
                 if party:
                     p = party.lower().strip()
@@ -746,14 +788,14 @@ async def pipeline(req: NLPParseRequest):
         score_req = groq_req
     else:
         try:
-            score_req, _ = _parse_raw_to_score_request(req)
+            score_req, _ = _parse_raw_to_score_request(req, user_id)
         except HTTPException:
             # Nothing extractable from THIS message — fall back to obligations
             # already ingested and stored in the DB (e.g. from a prior INGEST turn).
             db = SessionLocal()
             try:
-                rows = get_all_obligations(db, active_only=True)
-                snapshot = get_latest_cash_snapshot(db)
+                rows = get_all_obligations(db, active_only=True, user_id=user_id)
+                snapshot = get_latest_cash_snapshot(db, user_id=user_id)
             finally:
                 db.close()
 
@@ -803,7 +845,7 @@ async def pipeline(req: NLPParseRequest):
                 "obligation_id":     ob.obligation_id,
                 "penalty_rate_annual_pct": ob.penalty_rate_annual_pct,
             }
-            upsert_obligation(db, ob_dict, "CHAT", None)
+            upsert_obligation(db, ob_dict, "CHAT", None, user_id)
     finally:
         db.close()
 
@@ -845,7 +887,7 @@ async def pipeline(req: NLPParseRequest):
     db = SessionLocal()
     try:
         store_engine_run(db, result.run_id, result.model_dump(),
-                         raw_input=req.raw_text, source_type="CHAT")
+                         raw_input=req.raw_text, source_type="CHAT", user_id=user_id)
     except Exception as e:
         logger.warning("Failed to store engine run to DB: %s", e)
     finally:
@@ -984,52 +1026,55 @@ async def list_audits():
 # ─────────────────────────────────────────────
 
 @app.post("/upload/csv", tags=["File Import"])
-async def upload_csv(file: UploadFile = File(...)):
+async def upload_csv(file: UploadFile = File(...), user_id: str = DEFAULT_USER_ID):
     """Upload a CSV file of obligations.
-    
+
     The CSV should have columns like: counterparty/vendor/party, amount/amt, due_date/due.
     Columns are auto-mapped. If headers are non-standard, Groq will attempt to parse.
     Duplicate obligations (same counterparty + amount + due_date) are merged, not duplicated.
+    `user_id` scopes the import to a tenant (e.g. a Telegram chat_id).
     """
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
-    result = import_csv(content, file.filename or "upload.csv")
+    result = import_csv(content, file.filename or "upload.csv", user_id)
     return result.to_dict()
 
 
 @app.post("/upload/pdf", tags=["File Import"])
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...), user_id: str = DEFAULT_USER_ID):
     """Upload a PDF invoice/bill.
-    
+
     Text is extracted via pdfplumber, then parsed with Groq (or regex fallback)
     to identify obligations. Tables within the PDF are also extracted.
+    `user_id` scopes the import to a tenant (e.g. a Telegram chat_id).
     """
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
-    result = import_pdf(content, file.filename or "upload.pdf")
+    result = import_pdf(content, file.filename or "upload.pdf", user_id)
     return result.to_dict()
 
 
 @app.post("/upload/image", tags=["File Import"])
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(file: UploadFile = File(...), user_id: str = DEFAULT_USER_ID):
     """Upload an invoice/bill image for OCR.
-    
+
     The image is processed with Tesseract OCR (grayscale + sharpen),
     then the extracted text is parsed with Groq to identify obligations.
     Supports: .jpg, .png, .webp, .bmp, .tiff
+    `user_id` scopes the import to a tenant (e.g. a Telegram chat_id).
     """
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
-    result = import_image(content, file.filename or "upload.jpg")
+    result = import_image(content, file.filename or "upload.jpg", user_id)
     return result.to_dict()
 
 
@@ -1038,22 +1083,23 @@ async def upload_image(file: UploadFile = File(...)):
 # ─────────────────────────────────────────────
 
 @app.get("/obligations", tags=["Data"])
-async def list_obligations(category: Optional[str] = None, active_only: bool = True):
-    """List all stored obligations, optionally filtered by category."""
+async def list_obligations(category: Optional[str] = None, active_only: bool = True,
+                           user_id: str = DEFAULT_USER_ID):
+    """List all stored obligations for a tenant, optionally filtered by category."""
     db = SessionLocal()
     try:
-        rows = get_all_obligations(db, category=category, active_only=active_only)
+        rows = get_all_obligations(db, category=category, active_only=active_only, user_id=user_id)
         return {"count": len(rows), "obligations": [r.to_dict() for r in rows]}
     finally:
         db.close()
 
 
 @app.delete("/obligations/{obligation_id}", tags=["Data"])
-async def remove_obligation(obligation_id: str):
+async def remove_obligation(obligation_id: str, user_id: str = DEFAULT_USER_ID):
     """Delete an obligation by its dedup ID."""
     db = SessionLocal()
     try:
-        deleted = delete_obligation(db, obligation_id)
+        deleted = delete_obligation(db, obligation_id, user_id)
         if not deleted:
             raise HTTPException(404, f"Obligation '{obligation_id}' not found")
         return {"deleted": obligation_id}
@@ -1062,11 +1108,11 @@ async def remove_obligation(obligation_id: str):
 
 
 @app.get("/history", tags=["Data"])
-async def run_history(limit: int = 20):
-    """List recent engine runs with decisions."""
+async def run_history(limit: int = 20, user_id: str = DEFAULT_USER_ID):
+    """List recent engine runs with decisions for a tenant."""
     db = SessionLocal()
     try:
-        runs = get_run_history(db, limit=limit)
+        runs = get_run_history(db, limit=limit, user_id=user_id)
         return {
             "count": len(runs),
             "runs": [
@@ -1088,11 +1134,11 @@ async def run_history(limit: int = 20):
 
 
 @app.get("/profile", tags=["Profile"])
-async def get_profile():
-    """Fetch the business and personal profile."""
+async def get_profile(user_id: str = DEFAULT_USER_ID):
+    """Fetch the business and personal profile for a tenant."""
     db = SessionLocal()
     try:
-        profile = get_user_profile(db)
+        profile = get_user_profile(db, user_id)
         if not profile:
             return {}
         return profile.to_dict()
@@ -1101,11 +1147,11 @@ async def get_profile():
 
 
 @app.post("/profile", tags=["Profile"])
-async def save_profile(profile_data: UserProfile):
-    """Create or update the business and personal profile."""
+async def save_profile(profile_data: UserProfile, user_id: str = DEFAULT_USER_ID):
+    """Create or update the business and personal profile for a tenant."""
     db = SessionLocal()
     try:
-        profile = update_user_profile(db, profile_data.model_dump(exclude_unset=True))
+        profile = update_user_profile(db, profile_data.model_dump(exclude_unset=True), user_id)
         return profile.to_dict()
     finally:
         db.close()
@@ -1127,7 +1173,7 @@ class TransactionRequest(BaseModel):
 
 
 @app.post("/transactions", tags=["Transactions"])
-async def add_transaction(req: TransactionRequest):
+async def add_transaction(req: TransactionRequest, user_id: str = DEFAULT_USER_ID):
     """
     Record a cash movement (IN or OUT).
     The ref_id is auto-built from the medium prefix + external_ref.
@@ -1155,6 +1201,7 @@ async def add_transaction(req: TransactionRequest):
             notes=req.notes,
             external_ref=req.external_ref,
             source_type="API",
+            user_id=user_id,
         )
         return {
             "ref_id":     row.ref_id,
@@ -1173,15 +1220,16 @@ async def list_transactions(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     limit: int = 200,
+    user_id: str = DEFAULT_USER_ID,
 ):
-    """List all transactions with optional filters."""
+    """List all transactions for a tenant with optional filters."""
     from datetime import date as _date
     fd = _date.fromisoformat(from_date) if from_date else None
     td = _date.fromisoformat(to_date) if to_date else None
     db = SessionLocal()
     try:
         rows = get_transactions(db, direction=direction, medium=medium,
-                                from_date=fd, to_date=td, limit=limit)
+                                from_date=fd, to_date=td, limit=limit, user_id=user_id)
         return {"count": len(rows), "transactions": [r.to_dict() for r in rows]}
     finally:
         db.close()
@@ -1191,14 +1239,15 @@ async def list_transactions(
 async def transaction_summary(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
+    user_id: str = DEFAULT_USER_ID,
 ):
-    """Cash flow summary: total IN, total OUT, net, broken down by medium."""
+    """Cash flow summary for a tenant: total IN, total OUT, net, broken down by medium."""
     from datetime import date as _date
     fd = _date.fromisoformat(from_date) if from_date else None
     td = _date.fromisoformat(to_date) if to_date else None
     db = SessionLocal()
     try:
-        return get_tx_summary(db, from_date=fd, to_date=td)
+        return get_tx_summary(db, from_date=fd, to_date=td, user_id=user_id)
     finally:
         db.close()
 
